@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
 """
-Gemini Knowledge MCP Server
-A dynamic research agent for Cursor AI powered by Gemini 1.5 Pro.
+Crypto Knowledge MCP Server — FastMCP Edition
+Exposes three Gemini-backed crypto tools and one resource over SSE.
+Run locally:     python server.py            (defaults to SSE on :8000)
+In Docker:       PORT=9000 python server.py  (binds to 0.0.0.0:9000)
 """
 
-import asyncio
-import json
-import os
-from typing import Any, Sequence
-
-from google.genai import types
-from google import genai
+import os, json
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from fastmcp import FastMCP
 
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Resource,
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-    LoggingLevel
-)
-
-# Load environment variables
+# ------------------------------------------------------------------ #
+#  0.  Environment & model client
+# ------------------------------------------------------------------ #
 load_dotenv()
+if not os.getenv("GOOGLE_API_KEY"):
+    raise RuntimeError("GOOGLE_API_KEY is required")
 
-# Initialize Gemini client
 client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
-# Master prompt template
+# ------------------------------------------------------------------ #
+#  1.  Prompt template & helper
+# ------------------------------------------------------------------ #
 MASTER_PROMPT = """
 You are a world-class financial engineer and senior quantitative analyst. You have deep expertise in cryptocurrency trading, algorithmic strategies, advanced statistics, and machine learning models. 
 
@@ -63,224 +55,86 @@ The JSON object must strictly follow this structure:
 Now, begin your research and provide the structured response for the specified topic.
 """
 
-def extract_json_from_response(text: str) -> dict:
-    """Finds and parses the first valid JSON object from the model's text response."""
+def extract_json_from_response(text: str) -> str:
+    """Return a pretty JSON string parsed from a Gemini reply."""
     try:
-        # Find the start of the JSON markdown block
-        json_markdown_start = text.find('```json')
-        if json_markdown_start != -1:
-            # Find the end of the markdown block
-            json_markdown_end = text.rfind('```')
-            # Extract the JSON string (adjusting for the markers)
-            json_str = text[json_markdown_start + 7:json_markdown_end].strip()
-        else:
-            # If no markdown block is found, assume the whole text is a JSON string
-            json_str = text
+        start = text.find("```json")
+        end   = text.rfind("```")
+        json_str = text[start + 7:end].strip() if start != -1 else text
+        parsed   = json.loads(json_str)
+        return json.dumps(parsed, indent=2)
+    except Exception:
+        return json.dumps({"error": "Failed to parse JSON", "raw": text}, indent=2)
 
-        return json.loads(json_str)
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"JSON Parsing Error: {e}\nRaw Response:\n{text}")
-        return {"error": "Failed to parse JSON from model", "raw_response": text}
+# ------------------------------------------------------------------ #
+#  2.  FastMCP registration
+# ------------------------------------------------------------------ #
+mcp = FastMCP("crypto-knowledge-server")
 
-# Initialize MCP server
-server = Server("crypto-knowledge-server")
-
-@server.list_tools()
-async def handle_list_tools() -> list[Tool]:
-    """List available tools."""
-    return [
-        Tool(
-            name="explain_crypto_concept",
-            description="Get comprehensive explanations of cryptocurrency and quantitative finance concepts with implementation guides",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "description": "The cryptocurrency or quantitative finance concept to explain"
-                    }
-                },
-                "required": ["topic"]
-            }
-        ),
-        Tool(
-            name="get_crypto_strategy",
-            description="Get detailed trading strategies and algorithmic approaches for cryptocurrency markets",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "strategy_type": {
-                        "type": "string",
-                        "description": "The type of trading strategy or algorithmic approach to explain"
-                    }
-                },
-                "required": ["strategy_type"]
-            }
-        ),
-        Tool(
-            name="analyze_crypto_indicator",
-            description="Analyze technical indicators and their implementation in cryptocurrency trading",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "indicator": {
-                        "type": "string",
-                        "description": "The technical indicator to analyze and implement"
-                    }
-                },
-                "required": ["indicator"]
-            }
-        )
-    ]
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
-    
-    # Configure Gemini with Google Search
-    grounding_tool = types.Tool(google_search=types.GoogleSearch())
-    config = types.GenerateContentConfig(
-        tools=[grounding_tool],
+def _gemini_call(prompt: str) -> str:
+    """Internal helper that calls Gemini with Google Search grounding."""
+    tool = types.Tool(google_search=types.GoogleSearch())
+    cfg  = types.GenerateContentConfig(
+        tools=[tool],
         thinking_config=types.ThinkingConfig(include_thoughts=True),
     )
-    
-    try:
-        if name == "explain_crypto_concept":
-            topic = arguments.get("topic", "")
-            if not topic:
-                return [TextContent(type="text", text="Error: Topic is required")]
-            
-            final_prompt = MASTER_PROMPT.format(topic=topic)
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=final_prompt,
-                config=config
-            )
-            
-            structured_response = extract_json_from_response(response.text)
-            
-            # Format the response nicely
-            formatted_response = json.dumps(structured_response, indent=2)
-            return [TextContent(type="text", text=formatted_response)]
-            
-        elif name == "get_crypto_strategy":
-            strategy_type = arguments.get("strategy_type", "")
-            if not strategy_type:
-                return [TextContent(type="text", text="Error: Strategy type is required")]
-            
-            # Modify the prompt for strategy-specific requests
-            strategy_prompt = MASTER_PROMPT.format(topic=f"cryptocurrency trading strategy: {strategy_type}")
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=strategy_prompt,
-                config=config
-            )
-            
-            structured_response = extract_json_from_response(response.text)
-            formatted_response = json.dumps(structured_response, indent=2)
-            return [TextContent(type="text", text=formatted_response)]
-            
-        elif name == "analyze_crypto_indicator":
-            indicator = arguments.get("indicator", "")
-            if not indicator:
-                return [TextContent(type="text", text="Error: Indicator is required")]
-            
-            # Modify the prompt for indicator-specific requests
-            indicator_prompt = MASTER_PROMPT.format(topic=f"cryptocurrency technical indicator: {indicator}")
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=indicator_prompt,
-                config=config
-            )
-            
-            structured_response = extract_json_from_response(response.text)
-            formatted_response = json.dumps(structured_response, indent=2)
-            return [TextContent(type="text", text=formatted_response)]
-            
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-            
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+    reply = client.models.generate_content(
+        model="gemini-2.5-pro", contents=prompt, config=cfg
+    )
+    return extract_json_from_response(reply.text)
 
-@server.list_resources()
-async def handle_list_resources() -> list[Resource]:
-    """List available resources."""
-    return [
-        Resource(
-            uri="gemini://crypto-knowledge",
-            name="Crypto Knowledge Base",
-            description="Access to comprehensive cryptocurrency and quantitative finance knowledge",
-            mimeType="application/json"
-        )
-    ]
+# ---------- TOOLS -------------------------------------------------- #
 
-@server.read_resource()
-async def handle_read_resource(uri: str) -> str:
-    """Read a resource."""
-    if uri == "gemini://crypto-knowledge":
-        return json.dumps({
-            "description": "Gemini-powered cryptocurrency and quantitative finance knowledge base",
-            "capabilities": [
-                "Cryptocurrency concept explanations",
-                "Trading strategy analysis",
-                "Technical indicator implementation",
-                "Quantitative finance methods",
-                "Python code examples"
-            ],
-            "usage": "Use the available tools to get detailed explanations and implementations"
-        }, indent=2)
-    else:
-        raise ValueError(f"Unknown resource: {uri}")
+@mcp.tool(
+    name="explain_crypto_concept",
+    description="Explain a cryptocurrency or quantitative-finance concept"  # :contentReference[oaicite:2]{index=2}
+)
+def explain_crypto_concept(topic: str) -> str:
+    prompt = MASTER_PROMPT.format(topic=topic)
+    return _gemini_call(prompt)
 
-# async def main():
-#     """Main entry point for the MCP server."""
-#     # Validate environment
-#     if not os.environ.get("GOOGLE_API_KEY"):
-#         print("Error: GOOGLE_API_KEY environment variable is required")
-#         return
-#     async with stdio_server() as (read_stream, write_stream):
-#         await server.run(
-#             read_stream,
-#             write_stream,
-#             server.create_initialization_options()
-#         )
-#     # Run the server
-#     async with stdio_server() as (read_stream, write_stream):
-#         await server.run(
-#             read_stream,
-#             write_stream,
-#             InitializationOptions(
-#                 server_name="gemini-knowledge-server",
-#                 server_version="1.0.0",
-#                 capabilities=server.get_capabilities(
-#                     notification_options=None,
-#                     experimental_capabilities=None,
-#                 )
-#             )
-#         )
-from mcp.server.lowlevel.server import NotificationOptions   # NEW
+@mcp.tool(
+    name="get_crypto_strategy",
+    description="Generate a detailed algorithmic trading strategy outline"
+)
+def get_crypto_strategy(strategy_type: str) -> str:
+    prompt = MASTER_PROMPT.format(topic=f"cryptocurrency trading strategy: {strategy_type}")
+    return _gemini_call(prompt)
 
-# ...
+@mcp.tool(
+    name="analyze_crypto_indicator",
+    description="Analyse a technical indicator and show Python implementation"
+)
+def analyze_crypto_indicator(indicator: str) -> str:
+    prompt = MASTER_PROMPT.format(topic=f"cryptocurrency technical indicator: {indicator}")
+    return _gemini_call(prompt)
 
-async def main() -> None:
-    if not os.getenv("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY environment variable is required")
-        return
+# ---------- RESOURCE ---------------------------------------------- #
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="gemini-knowledge-server",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+@mcp.resource("gemini://crypto-knowledge")   # :contentReference[oaicite:3]{index=3}
+def crypto_knowledge_base() -> str:
+    """Static metadata describing this server."""
+    return json.dumps({
+        "description": "Gemini-powered cryptocurrency & quantitative finance knowledge base",
+        "capabilities": [
+            "Concept explanations",
+            "Trading strategy design",
+            "Indicator implementation",
+            "Python snippets"
+        ],
+        "usage": "Invoke the tools with the relevant arguments"
+    }, indent=2)
 
+# ------------------------------------------------------------------ #
+#  3.  Entry-point
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Expose over **SSE** so any remote MCP client can connect.  FastMCP handles
+    # the Uvicorn webserver for you; override host/port with env vars if needed.
+    mcp.run(
+        # transport="sse",               # one-word change to go remote :contentReference[oaicite:4]{index=4}
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+log_level="debug",
+        transport="http", path="/mcp",
+    )
