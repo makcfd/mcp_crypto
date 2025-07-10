@@ -1,0 +1,9 @@
+
+{
+  "servers": {
+    "crypto-knowledge": {
+      "command": "python",
+      "args": ["crypto_mcp.py"]
+    }
+  }
+}
